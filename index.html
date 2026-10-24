@@ -135,6 +135,9 @@ h2 { margin: 0; font-size: 18px; font-weight: 600; }
 .scores .mode { font-size: 13px; font-weight: 600; color: var(--ink-soft); background: var(--paper); border: 1.5px solid var(--grid); border-radius: 8px; padding: 1px 6px; white-space: nowrap; }
 .scores .pts { font-weight: 700; font-variant-numeric: tabular-nums; }
 .empty { font-family: var(--font-hand); font-size: 19px; color: var(--ink-soft); margin: 0; }
+.toggles { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; }
+.toggle[aria-pressed="true"] { color: var(--ink); border-color: var(--mint-ink); background: var(--mint); }
+.tilt-note { margin: -6px 0 0; text-align: center; font-family: var(--font-hand); font-size: 18px; color: var(--bad); }
 .toggle { justify-self: center; font: 500 17px var(--font-display); color: var(--ink-soft); background: none; border: 2px solid var(--grid); border-radius: 999px; padding: 6px 14px; cursor: pointer; }
 .big-score { text-align: center; font-size: 64px; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; }
 .big-score small { display: block; font: 400 20px var(--font-hand); color: var(--ink-soft); margin-top: 4px; }
@@ -187,7 +190,11 @@ h2 { margin: 0; font-size: 18px; font-weight: 600; }
         <h2>Bestenliste</h2>
         <div id="menuScores" style="margin-top:8px"></div>
       </div>
-      <button class="toggle" id="soundBtn"></button>
+      <div class="toggles">
+        <button class="toggle" id="soundBtn"></button>
+        <button class="toggle" id="tiltBtn"></button>
+      </div>
+      <p class="tilt-note" id="tiltNote" hidden></p>
     </div>
   </div>
 
@@ -245,7 +252,7 @@ h2 { margin: 0; font-size: 18px; font-weight: 600; }
     get(k, d) { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch (e) { return d; } },
     set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
   };
-  const settings = Object.assign({ rows: [1,2,3,4,5,6,7,8,9,10], sound: true, name: '', timer: 0 }, store.get('emh_settings', {}));
+  const settings = Object.assign({ rows: [1,2,3,4,5,6,7,8,9,10], sound: true, name: '', timer: 0, tilt: false }, store.get('emh_settings', {}));
   let scores = store.get('emh_scores', []);
   const saveSettings = () => store.set('emh_settings', settings);
 
@@ -331,6 +338,28 @@ h2 { margin: 0; font-size: 18px; font-weight: 600; }
   const TIME_OPTIONS = [0, 20, 15, 10, 7, 5];
   const input = { left: false, right: false, pointers: new Map() };
 
+  // ---------- Neigungssteuerung ----------
+  const tilt = { value: 0, listening: false, seen: false };
+  function onOrient(e) {
+    if (e.gamma == null) return;
+    tilt.seen = true;
+    // Im Querformat liefert beta die Links-Rechts-Neigung
+    const ang = (screen.orientation && screen.orientation.angle) || window.orientation || 0;
+    let v = e.gamma;
+    if (ang === 90) v = e.beta; else if (ang === -90 || ang === 270) v = -e.beta;
+    const DEAD = 3, FULL = 18; // Grad: kleine Wackler ignorieren, ab 21° volle Geschwindigkeit
+    tilt.value = Math.abs(v) < DEAD ? 0 : Math.max(-1, Math.min(1, (v - Math.sign(v) * DEAD) / FULL));
+  }
+  async function enableTilt() {
+    try {
+      if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+        if (await DeviceOrientationEvent.requestPermission() !== 'granted') return false;
+      }
+    } catch (e) { return false; }
+    if (!tilt.listening) { window.addEventListener('deviceorientation', onOrient); tilt.listening = true; }
+    return true;
+  }
+
   const choicesNow = () => (correctCount < 8 ? 3 : 4);
 
   // Freie Bereiche links/rechts der Spalte über px (mit Bildschirm-Umlauf)
@@ -385,6 +414,7 @@ h2 { margin: 0; font-size: 18px; font-weight: 600; }
   }
 
   function startGame() {
+    if (settings.tilt) enableTilt(); // iOS fragt nur innerhalb eines Tipps nach der Erlaubnis
     audio();
     score = 0; hearts = 3; streak = 0; correctCount = 0; mistakes = []; pendingOver = false; overTimer = 0;
     qCount = 0; review = []; lastQ = null;
@@ -395,6 +425,10 @@ h2 { margin: 0; font-size: 18px; font-weight: 600; }
     state = 'play';
     $('#menu').hidden = true; $('#over').hidden = true; $('#pause').hidden = true;
     $('#hud').hidden = false; $('#hint').hidden = true;
+    $('#ctrlHint').innerHTML = settings.tilt
+      ? '<span>◀ Handy neigen ▶</span>'
+      : '<span>◀ hier halten</span><span>hier halten ▶</span>';
+    $('#ctrlHint').style.justifyContent = settings.tilt ? 'center' : 'space-between';
     $('#ctrlHint').hidden = false; $('#ctrlHint').style.opacity = 1; ctrlHintTimer = 6;
     renderHearts(); renderScore(); renderTask();
   }
@@ -484,10 +518,15 @@ h2 { margin: 0; font-size: 18px; font-weight: 600; }
   function bounce() { player.vy = -JUMP_V; player.squash = 1; if (state !== 'menu') sfx.jump(); }
 
   function update(dt) {
-    const dir = state === 'play' ? (input.right ? 1 : 0) - (input.left ? 1 : 0) : 0;
+    // Tippen hat Vorrang, sonst Neigen (stufenlos zwischen -1 und 1)
+    let dir = 0;
+    if (state === 'play') {
+      dir = (input.right ? 1 : 0) - (input.left ? 1 : 0);
+      if (!dir && settings.tilt) dir = tilt.value;
+    }
     player.vx += (dir * SPEED - player.vx) * Math.min(1, dt * 12);
     // Platten zählen erst, wenn das Kind seit der Aufgabe gelenkt hat
-    if (dir) { player.face = dir; if (nextRow) nextRow.armed = true; }
+    if (Math.abs(dir) > 0.25) { player.face = Math.sign(dir); if (nextRow) nextRow.armed = true; }
     player.x = ((player.x + player.vx * dt) % W + W) % W;
 
     const prevY = player.y;
@@ -762,12 +801,33 @@ h2 { margin: 0; font-size: 18px; font-weight: 600; }
       : 'Kein Zeitdruck: Du hast so lange Zeit, wie du willst.';
   }
   function renderSound() { $('#soundBtn').textContent = settings.sound ? '🔊 Ton an' : '🔇 Ton aus'; }
+  function renderTilt() {
+    const b = $('#tiltBtn');
+    b.textContent = settings.tilt ? '📱 Neigen an' : '📱 Neigen aus';
+    b.setAttribute('aria-pressed', !!settings.tilt);
+  }
+  $('#tiltBtn').addEventListener('click', async () => {
+    $('#tiltNote').hidden = true;
+    if (settings.tilt) { settings.tilt = false; saveSettings(); renderTilt(); return; }
+    settings.tilt = true; renderTilt();
+    const ok = await enableTilt();
+    // Kommt kein Messwert, blockiert der Browser den Sensor (oder es ist kein Handy)
+    if (ok) await new Promise(r => setTimeout(r, 1200));
+    if (!ok || !tilt.seen) {
+      settings.tilt = false;
+      $('#tiltNote').textContent = ok
+        ? 'Neigen klappt hier leider nicht. Steuere mit Tippen.'
+        : 'Neigen wurde nicht erlaubt. Steuere mit Tippen.';
+      $('#tiltNote').hidden = false;
+    }
+    saveSettings(); renderTilt();
+  });
   $('#soundBtn').addEventListener('click', () => { settings.sound = !settings.sound; saveSettings(); renderSound(); if (settings.sound) sfx.good(); });
   function showMenu() {
     state = 'menu'; resetWorld();
     $('#over').hidden = true; $('#hud').hidden = true; $('#ctrlHint').hidden = true;
     $('#menu').hidden = false; $('#menu').scrollTop = 0;
-    renderChips(); renderTimeChips(); renderSound(); renderScores($('#menuScores'));
+    renderChips(); renderTimeChips(); renderSound(); renderTilt(); renderScores($('#menuScores'));
   }
   $('#startBtn').addEventListener('click', startGame);
   $('#againBtn').addEventListener('click', startGame);
